@@ -3,12 +3,27 @@
  * 只在 pianos 表为空时执行。钢琴 → 调律记录 → 维修 / 环境 → 周期提醒 互相引用，
  * 其中包含 1 台超期琴与 2 条异常环境记录，保证 5 个页面第一次进入都有内容可看。
  */
-import type { PianoRow, TuningRow, VoicingRow, EnvironmentRow, ReminderRow } from './db';
+import type { PianoRow, TuningRow, VoicingRow, EnvironmentRow, ReminderRow, ThresholdRow } from './db';
 import { db, ROW_REVISION } from './db';
+import { DEFAULT_THRESHOLD_ID } from '$lib/types/threshold';
+import { TEMP_RANGE, HUMIDITY_RANGE } from '$lib/types/environment';
 
 function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
   const now = Date.now();
   return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
+}
+
+/** 内置默认阈值版本：自 2000 年起生效，保证任意历史日期都能匹配到阈值 */
+export function defaultThresholdRow(): ThresholdRow {
+  return rev({
+    id: DEFAULT_THRESHOLD_ID,
+    effectiveDate: '2000-01-01',
+    tempMin: TEMP_RANGE[0],
+    tempMax: TEMP_RANGE[1],
+    humidityMin: HUMIDITY_RANGE[0],
+    humidityMax: HUMIDITY_RANGE[1],
+    note: '系统默认建议区间'
+  });
 }
 
 const PIANOS: Array<Omit<PianoRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
@@ -71,13 +86,18 @@ const REMINDERS: Array<Omit<ReminderRow, 'revision' | 'createdAt' | 'updatedAt'>
   { id: 'rm-003', pianoId: 'pn-003', cycleMonths: 12, lastTuningDate: '2023-11-02', nextDueDate: '2024-11-02', state: '超期' }
 ];
 
-/** 灌入演示数据（钢琴 → 调律 → 维修 / 环境 → 提醒） */
+/** 灌入演示数据（阈值 → 钢琴 → 调律 → 维修 / 环境 → 提醒） */
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
-    await db.pianos.bulkPut(PIANOS.map(rev));
-    await db.tunings.bulkPut(TUNINGS.map(rev));
-    await db.voicings.bulkPut(VOICINGS.map(rev));
-    await db.environments.bulkPut(ENVIRONMENTS.map(rev));
-    await db.reminders.bulkPut(REMINDERS.map(rev));
-  });
+  await db.transaction(
+    'rw',
+    [db.pianos, db.tunings, db.voicings, db.environments, db.reminders, db.thresholds],
+    async () => {
+      await db.thresholds.put(defaultThresholdRow());
+      await db.pianos.bulkPut(PIANOS.map(rev));
+      await db.tunings.bulkPut(TUNINGS.map(rev));
+      await db.voicings.bulkPut(VOICINGS.map(rev));
+      await db.environments.bulkPut(ENVIRONMENTS.map(rev));
+      await db.reminders.bulkPut(REMINDERS.map(rev));
+    }
+  );
 }

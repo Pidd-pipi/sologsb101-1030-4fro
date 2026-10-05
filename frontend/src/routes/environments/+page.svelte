@@ -1,21 +1,25 @@
 <script lang="ts">
-  /** /environments 琴房温湿度记录：按日期录入并高亮超标区间 */
+  /** /environments 琴房温湿度记录：按当天生效阈值判定越界，批量限额排队，联动调律提醒 */
   import { onMount } from 'svelte';
   import { push, router } from '$lib/router';
   import FilterBar from '$lib/components/common/FilterBar.svelte';
   import StatBadge from '$lib/components/common/StatBadge.svelte';
   import EmptyPanel from '$lib/components/common/EmptyPanel.svelte';
+  import ThresholdPanel from '$lib/components/environments/ThresholdPanel.svelte';
+  import BatchImportDialog from '$lib/components/environments/BatchImportDialog.svelte';
+  import ImportQueuePanel from '$lib/components/environments/ImportQueuePanel.svelte';
   import { useIdbTable } from '$lib/hooks/useIdbTable';
-  import { db, type EnvironmentRow, type PianoRow } from '$lib/utils/db';
+  import { db, type EnvironmentRow, type EnvQueueRow, type PianoRow, type ThresholdRow } from '$lib/utils/db';
   import {
     abnormalHint,
     createEmptyEnvironment,
     ENV_DEVICES,
-    HUMIDITY_RANGE,
     isAbnormal,
-    TEMP_RANGE,
+    type EnvRanges,
     type Environment
   } from '$lib/types/environment';
+  import { DEFAULT_RANGES } from '$lib/types/environment';
+  import { effectiveThreshold, rangesOf } from '$lib/types/threshold';
   import {
     createEnvironment,
     deleteEnvironment,
@@ -23,27 +27,50 @@
     ENVIRONMENT_FILTER_KEYS,
     environmentFilters,
     resetEnvironmentFilters,
-    setEnvironmentFilters
+    setEnvironmentFilters,
+    releaseDueQueue
   } from '$lib/stores/environmentStore';
+  import { clearEnvironmentDraft, loadEnvironmentDraft, saveEnvironmentDraft, type EnvironmentDraft } from '$lib/utils/envDraft';
   import type { FilterModel } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
 
   const pianos = useIdbTable<PianoRow>(db.pianos, (a, b) => a.brand.localeCompare(b.brand, 'zh-Hans-CN'));
   const environments = useIdbTable<EnvironmentRow>(db.environments, (a, b) => b.date.localeCompare(a.date));
+  const thresholds = useIdbTable<ThresholdRow>(db.thresholds, (a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
+  const queue = useIdbTable<EnvQueueRow>(db.envQueue, (a, b) => a.scheduledFor.localeCompare(b.scheduledFor));
 
   let dialogOpen = $state(false);
   let editingId = $state<string | null>(null);
   let form = $state<Omit<Environment, 'id'>>(createEmptyEnvironment());
   let formError = $state<string | null>(null);
+  let draftNotice = $state<EnvironmentDraft | null>(null);
+  let batchOpen = $state(false);
+  let thresholdExpanded = $state(false);
+  let queueMessage = $state<string | null>(null);
 
   function asArray(value: string | string[] | boolean | undefined): string[] {
     return Array.isArray(value) ? value : [];
   }
 
-  function pianoLabel(pianoId: string): string {
-    const piano = $pianos.find((item) => item.id === pianoId);
-    return piano ? `${piano.brand} ${piano.model}` : '钢琴已删除';
+  function pianoById(pianoId: string): PianoRow | undefined {
+    return $pianos.find((item) => item.id === pianoId);
   }
+
+  function pianoLabel(pianoId: string): string {
+    const piano = pianoById(pianoId);
+    if (!piano) return '钢琴已删除';
+    return `${piano.brand} ${piano.model}${piano.state === '停用' ? '（已停用）' : ''}`;
+  }
+
+  /** 某日期当天生效的阈值区间 */
+  function rangesAt(date: string): EnvRanges {
+    const current = effectiveThreshold($thresholds, date);
+    return current ? rangesOf(current) : DEFAULT_RANGES;
+  }
+
+  /** 今天生效的阈值（页头说明用） */
+  const currentThreshold = $derived(effectiveThreshold($thresholds, new Date().toISOString().slice(0, 10)));
+  const currentRanges = $derived<EnvRanges>(currentThreshold ? rangesOf(currentThreshold) : DEFAULT_RANGES);
 
   const filtered = $derived(
     $environments.filter((row) => {
@@ -77,32 +104,66 @@
     };
   });
 
+  const pendingQueueCount = $derived($queue.filter((item) => item.status === '待处理').length);
+
+  function applyDraftToForm(draft: EnvironmentDraft): void {
+    form = {
+      pianoId: draft.pianoId,
+      date: draft.date,
+      tempC: draft.tempC,
+      humidityPct: draft.humidityPct,
+      device: draft.device,
+      abnormal: draft.abnormal,
+      thresholdVersion: draft.thresholdVersion,
+      batchId: draft.batchId
+    };
+  }
+
   function openCreate(): void {
     editingId = null;
-    form = createEmptyEnvironment();
-    form.pianoId = $pianos[0]?.id ?? '';
-    form.abnormal = isAbnormal(form.tempC, form.humidityPct);
     formError = null;
+    const draft = loadEnvironmentDraft();
+    if (draft) {
+      draftNotice = draft;
+      applyDraftToForm(draft);
+    } else {
+      draftNotice = null;
+      form = createEmptyEnvironment();
+      const firstActive = $pianos.find((piano) => piano.state !== '停用');
+      form.pianoId = firstActive?.id ?? $pianos[0]?.id ?? '';
+      form.abnormal = isAbnormal(form.tempC, form.humidityPct, rangesAt(form.date));
+    }
     dialogOpen = true;
   }
 
   function openEdit(row: EnvironmentRow): void {
     editingId = row.id;
+    draftNotice = null;
     form = {
       pianoId: row.pianoId,
       date: row.date,
       tempC: row.tempC,
       humidityPct: row.humidityPct,
       device: row.device,
-      abnormal: row.abnormal
+      abnormal: row.abnormal,
+      thresholdVersion: row.thresholdVersion,
+      batchId: row.batchId
     };
     formError = null;
     dialogOpen = true;
   }
 
-  /** 录入即时判定是否超标 */
+  function discardDraft(): void {
+    clearEnvironmentDraft();
+    draftNotice = null;
+    form = createEmptyEnvironment();
+    const firstActive = $pianos.find((piano) => piano.state !== '停用');
+    form.pianoId = firstActive?.id ?? '';
+  }
+
+  /** 录入即时按当天生效阈值判定是否越界 */
   function recalc(): void {
-    form.abnormal = isAbnormal(form.tempC, form.humidityPct);
+    form.abnormal = isAbnormal(form.tempC, form.humidityPct, rangesAt(form.date));
   }
 
   async function submit(): Promise<void> {
@@ -115,16 +176,41 @@
       return;
     }
     recalc();
+    const payload = { ...form };
+
     if (editingId) {
-      await editEnvironment(editingId, { ...form });
-    } else {
-      await createEnvironment({ ...form });
+      const outcome = await editEnvironment(editingId, payload);
+      if (outcome.ok) {
+        dialogOpen = false;
+      } else if (outcome.reason === 'piano-inactive') {
+        formError = '该钢琴已停用，修改未写入';
+      } else if (outcome.reason === 'piano-missing') {
+        formError = '所选钢琴不存在，请重新选择';
+      } else {
+        formError = '记录不存在或已被删除';
+      }
+      return;
     }
-    dialogOpen = false;
+
+    const outcome = await createEnvironment(payload);
+    if (outcome.ok) {
+      clearEnvironmentDraft();
+      draftNotice = null;
+      dialogOpen = false;
+      return;
+    }
+    if (outcome.reason === 'piano-inactive') {
+      // 引用钢琴停用：不写入，草稿留着下次继续（弹窗保留全部输入）
+      saveEnvironmentDraft(payload);
+      draftNotice = loadEnvironmentDraft();
+      formError = '该钢琴已停用，本条记录未写入；草稿已保留，下次可继续编辑。';
+    } else if (outcome.reason === 'piano-missing') {
+      formError = '所选钢琴不存在，请重新选择';
+    }
   }
 
   async function remove(row: EnvironmentRow): Promise<void> {
-    if (!window.confirm(`删除 ${row.date} 的环境记录？`)) return;
+    if (!window.confirm(`删除 ${row.date} 的环境记录？删除后该琴的调律提醒会同步重算。`)) return;
     await deleteEnvironment(row.id);
   }
 
@@ -139,28 +225,49 @@
       query[key] = value;
     });
     setEnvironmentFilters(queryToFilters(query, ENVIRONMENT_FILTER_KEYS));
+    // 启动时放行今天到期的排队条目（受当日 200 条上限约束）
+    void releaseDueQueue().then((outcome) => {
+      if (outcome.processed > 0) {
+        queueMessage = `启动时自动从队列放行 ${outcome.processed} 条记录，队列剩余 ${outcome.remaining} 条。`;
+      }
+    });
   });
 </script>
 
-<div class="page">
+<div class="page space-y-4">
   <div class="page-head">
     <div>
       <h2 class="page-title">琴房温湿度记录</h2>
       <p class="page-subtitle">
-        建议区间：温度 {TEMP_RANGE[0]}–{TEMP_RANGE[1]} ℃、湿度 {HUMIDITY_RANGE[0]}–{HUMIDITY_RANGE[1]} %；超出即自动标记异常。
+        今日生效阈值（{currentThreshold ? currentThreshold.effectiveDate : '默认'}）：温度
+        {currentRanges.temp[0]}–{currentRanges.temp[1]} ℃、湿度 {currentRanges.humidity[0]}–{currentRanges.humidity[1]}
+        %；越界记录会联动重算该琴调律提醒。
       </p>
     </div>
-    <button type="button" class="btn-primary" onclick={openCreate} disabled={$pianos.length === 0}>+ 新增环境记录</button>
+    <div class="flex flex-wrap gap-2">
+      <button type="button" class="btn" onclick={() => (batchOpen = true)} disabled={$pianos.length === 0}>
+        记录仪批量导入{#if pendingQueueCount > 0}（排队 {pendingQueueCount}）{/if}
+      </button>
+      <button type="button" class="btn-primary" onclick={openCreate} disabled={$pianos.length === 0}>+ 新增环境记录</button>
+    </div>
   </div>
+
+  {#if queueMessage}
+    <div class="rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-700">{queueMessage}</div>
+  {/if}
 
   <div class="badge-row">
     <StatBadge label="环境记录" value={totals.total} suffix="条" tone="walnut" icon="🌡️" />
-    <StatBadge label="超标天数" value={totals.abnormal} suffix="天" tone="rose" icon="!" />
-    <StatBadge label="超标占比" value={totals.abnormalRatio} percent={totals.abnormalRatio} showPercent tone="amber" icon="%" />
+    <StatBadge label="越界天数" value={totals.abnormal} suffix="天" tone="rose" icon="!" />
+    <StatBadge label="越界占比" value={totals.abnormalRatio} percent={totals.abnormalRatio} showPercent tone="amber" icon="%" />
     <StatBadge label="平均温度" value={totals.avgTemp} suffix="℃" tone="brass" icon="≈" />
     <StatBadge label="平均湿度" value={totals.avgHumidity} suffix="%" tone="slate" icon="💧" />
     <StatBadge label="覆盖钢琴" value={totals.pianoCovered} suffix="台" tone="green" icon="🎹" />
   </div>
+
+  <ThresholdPanel bind:thresholds={$thresholds} bind:expanded={thresholdExpanded} />
+
+  <ImportQueuePanel queue={$queue} pianos={$pianos} />
 
   <FilterBar
     filters={$environmentFilters}
@@ -172,7 +279,7 @@
       }
     ]}
     keywordPlaceholder="搜索钢琴 / 监测方式 / 日期…"
-    switchLabel="仅看超标记录"
+    switchLabel="仅看越界记录"
     onchange={applyFilters}
     onreset={() => {
       resetEnvironmentFilters();
@@ -183,7 +290,7 @@
   {#if filtered.length === 0}
     <EmptyPanel
       title="暂无环境记录"
-      description="按日期录入琴房温度与相对湿度，超标记录会自动高亮。"
+      description="按日期录入琴房温度与相对湿度，系统按当天生效阈值判定，越界记录自动高亮并联动调律提醒。"
       showCreate={$pianos.length > 0}
       createText="新增环境记录"
       oncreate={openCreate}
@@ -204,23 +311,29 @@
         </thead>
         <tbody>
           {#each filtered as row (row.id)}
+            {@const ranges = rangesAt(row.date)}
+            {@const tempOutOf = row.tempC < ranges.temp[0] || row.tempC > ranges.temp[1]}
+            {@const humOutOf = row.humidityPct < ranges.humidity[0] || row.humidityPct > ranges.humidity[1]}
             <tr class="border-b border-stone-100 {row.abnormal ? 'bg-rose-50/70' : ''}">
               <td class="py-2">{pianoLabel(row.pianoId)}</td>
               <td class="py-2">{row.date}</td>
-              <td class="py-2 tabular-nums {row.abnormal && (row.tempC < TEMP_RANGE[0] || row.tempC > TEMP_RANGE[1]) ? 'font-semibold text-rose-700' : ''}">
+              <td class="py-2 tabular-nums {row.abnormal && tempOutOf ? 'font-semibold text-rose-700' : ''}">
                 {row.tempC}
               </td>
-              <td class="py-2 tabular-nums {row.abnormal && (row.humidityPct < HUMIDITY_RANGE[0] || row.humidityPct > HUMIDITY_RANGE[1]) ? 'font-semibold text-rose-700' : ''}">
+              <td class="py-2 tabular-nums {row.abnormal && humOutOf ? 'font-semibold text-rose-700' : ''}">
                 {row.humidityPct}
               </td>
-              <td class="py-2">{row.device}</td>
+              <td class="py-2">
+                {row.device}
+                {#if row.batchId}<span class="muted ml-1 text-[10px]">批量</span>{/if}
+              </td>
               <td class="py-2">
                 <span
                   class="rounded-full px-2 py-0.5 text-xs {row.abnormal
                     ? 'bg-rose-100 text-rose-700'
-                    : 'bg-emerald-100 text-emerald-700'}">{row.abnormal ? '超标' : '正常'}</span
+                    : 'bg-emerald-100 text-emerald-700'}">{row.abnormal ? '越界' : '正常'}</span
                 >
-                <div class="muted mt-0.5">{abnormalHint(row.tempC, row.humidityPct)}</div>
+                <div class="muted mt-0.5">{abnormalHint(row.tempC, row.humidityPct, ranges)}</div>
               </td>
               <td class="py-2">
                 <button type="button" class="btn mr-2" onclick={() => openEdit(row)}>编辑</button>
@@ -244,6 +357,12 @@
     ></button>
     <div class="modal-panel relative" role="dialog" aria-modal="true">
       <h3 class="mb-4 text-base font-semibold">{editingId ? '编辑环境记录' : '新增环境记录'}</h3>
+      {#if draftNotice && !editingId}
+        <div class="mb-3 flex items-start justify-between gap-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span>已恢复上次草稿（{draftNotice.savedAt.slice(0, 16).replace('T', ' ')} 因钢琴停用未写入），可继续编辑或改选钢琴。</span>
+          <button type="button" class="shrink-0 underline" onclick={discardDraft}>放弃草稿</button>
+        </div>
+      {/if}
       {#if formError}
         <div class="mb-3 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{formError}</div>
       {/if}
@@ -252,13 +371,15 @@
           <span class="label">钢琴</span>
           <select class="field" bind:value={form.pianoId}>
             {#each $pianos as piano (piano.id)}
-              <option value={piano.id}>{piano.brand} {piano.model}</option>
+              <option value={piano.id}>
+                {piano.brand} {piano.model}{piano.state === '停用' ? '（已停用，提交将被拒绝并存草稿）' : ''}
+              </option>
             {/each}
           </select>
         </div>
         <div>
           <span class="label">日期</span>
-          <input class="field" type="date" bind:value={form.date} />
+          <input class="field" type="date" bind:value={form.date} onchange={recalc} />
         </div>
         <div>
           <span class="label">温度 ℃</span>
@@ -278,7 +399,9 @@
         </div>
       </div>
       <div class="mt-4 rounded-lg px-3 py-2 text-xs {form.abnormal ? 'bg-rose-50 text-rose-700' : 'bg-emerald-50 text-emerald-700'}">
-        {form.abnormal ? '自动判定：超标' : '自动判定：处于建议区间'} · {abnormalHint(form.tempC, form.humidityPct)}
+        当天生效区间 {rangesAt(form.date).temp[0]}–{rangesAt(form.date).temp[1]} ℃ /
+        {rangesAt(form.date).humidity[0]}–{rangesAt(form.date).humidity[1]} %：{form.abnormal ? '越界' : '处于区间内'} ·
+        {abnormalHint(form.tempC, form.humidityPct, rangesAt(form.date))}
       </div>
       <div class="mt-5 flex justify-end gap-2">
         <button type="button" class="btn" onclick={() => (dialogOpen = false)}>取消</button>
@@ -287,3 +410,5 @@
     </div>
   </div>
 {/if}
+
+<BatchImportDialog bind:open={batchOpen} pianos={$pianos} />

@@ -1,6 +1,9 @@
 /** 调律周期状态 */
 export type ReminderState = '正常' | '临近' | '超期';
 
+/** 提醒来源：手工建立 / 环境越界自动补建 */
+export type ReminderSource = 'manual' | 'environment';
+
 /** 调律周期提醒 */
 export interface Reminder {
   id: string;
@@ -14,6 +17,8 @@ export interface Reminder {
   nextDueDate: string;
   /** 周期状态 */
   state: ReminderState;
+  /** 来源（v2 起：环境越界自动补建的提醒在越界清除且无调律基准时自动回收） */
+  triggerSource?: ReminderSource;
 }
 
 export const REMINDER_STATES: ReminderState[] = ['正常', '临近', '超期'];
@@ -24,6 +29,15 @@ export function addMonths(date: string, months: number): string {
   const base = new Date(`${date}T00:00:00`);
   if (Number.isNaN(base.getTime())) return '';
   base.setMonth(base.getMonth() + months);
+  return base.toISOString().slice(0, 10);
+}
+
+/** 在日期上增加天数 */
+export function addDays(date: string, days: number): string {
+  if (!date) return '';
+  const base = new Date(`${date}T00:00:00`);
+  if (Number.isNaN(base.getTime())) return '';
+  base.setDate(base.getDate() + days);
   return base.toISOString().slice(0, 10);
 }
 

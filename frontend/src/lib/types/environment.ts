@@ -14,34 +14,46 @@ export interface Environment {
   humidityPct: number;
   /** 监测方式 */
   device: EnvDevice;
-  /** 是否超标 */
+  /** 是否越界（按记录当天生效的阈值版本判定后落库） */
   abnormal: boolean;
+  /** 判定时生效的阈值版本 id */
+  thresholdVersion?: string;
+  /** 记录仪批量导入的批次 id */
+  batchId?: string;
 }
 
-/** 建议温度区间 ℃ */
+/** 默认建议温度区间 ℃（无阈值版本时兜底） */
 export const TEMP_RANGE: [number, number] = [18, 26];
-/** 建议湿度区间 % */
+/** 默认建议湿度区间 %（无阈值版本时兜底） */
 export const HUMIDITY_RANGE: [number, number] = [40, 60];
 
 export const ENV_DEVICES: EnvDevice[] = ['温湿度计', '记录仪'];
 
-/** 温度和湿度是否超出建议区间 */
-export function isAbnormal(tempC: number, humidityPct: number): boolean {
+export interface EnvRanges {
+  temp: [number, number];
+  humidity: [number, number];
+}
+
+/** 默认建议区间 */
+export const DEFAULT_RANGES: EnvRanges = { temp: TEMP_RANGE, humidity: HUMIDITY_RANGE };
+
+/** 温度和湿度是否超出给定区间（未传时用默认建议区间） */
+export function isAbnormal(tempC: number, humidityPct: number, ranges: EnvRanges = DEFAULT_RANGES): boolean {
   return (
-    tempC < TEMP_RANGE[0] ||
-    tempC > TEMP_RANGE[1] ||
-    humidityPct < HUMIDITY_RANGE[0] ||
-    humidityPct > HUMIDITY_RANGE[1]
+    tempC < ranges.temp[0] ||
+    tempC > ranges.temp[1] ||
+    humidityPct < ranges.humidity[0] ||
+    humidityPct > ranges.humidity[1]
   );
 }
 
-/** 超标项的文字提示 */
-export function abnormalHint(tempC: number, humidityPct: number): string {
+/** 越界项的文字提示（按给定区间） */
+export function abnormalHint(tempC: number, humidityPct: number, ranges: EnvRanges = DEFAULT_RANGES): string {
   const hints: string[] = [];
-  if (tempC < TEMP_RANGE[0]) hints.push('温度偏低，建议升温');
-  if (tempC > TEMP_RANGE[1]) hints.push('温度偏高，建议通风降温');
-  if (humidityPct < HUMIDITY_RANGE[0]) hints.push('湿度偏低，建议加湿');
-  if (humidityPct > HUMIDITY_RANGE[1]) hints.push('湿度偏高，建议除湿');
+  if (tempC < ranges.temp[0]) hints.push('温度偏低，建议升温');
+  if (tempC > ranges.temp[1]) hints.push('温度偏高，建议通风降温');
+  if (humidityPct < ranges.humidity[0]) hints.push('湿度偏低，建议加湿');
+  if (humidityPct > ranges.humidity[1]) hints.push('湿度偏高，建议除湿');
   return hints.join('；') || '处于建议区间';
 }
 

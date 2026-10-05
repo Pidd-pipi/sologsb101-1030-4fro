@@ -70,7 +70,7 @@ npm run check      # 仅做类型检查
 | `/pianos` | 钢琴档案台账 | Piano、Tuning、Reminder | 新建/编辑/删除琴档（删除确认与级联）、按品牌/类型/场所筛选、卡片回显最近调律日期、平均音分偏差与下次建议日期、筛选同步 URL query |
 | `/tunings` | 调律记录 | Tuning、Piano | 录入基准音高与低/中/高音区音分偏差、自动计算平均与最大值、**音区偏差条形图**、超阈值自动标记需复调 |
 | `/voicings` | 整音与维修 | Voicing、Piano | 登记毡槌/击弦机/换弦/踏板事项、按钢琴汇总维修履历、切换计划/已完成（完成回写钢琴状态） |
-| `/environments` | 琴房温湿度记录 | Environment、Piano | 按日期录入温湿度、**超出建议区间（18–26 ℃ / 40–60 %）自动判定并用 Tailwind 高亮超标行**、超标天数统计 |
+| `/environments` | 琴房温湿度记录 | Environment、Piano、EnvThreshold、EnvQueueItem | 按日期录入温湿度，**按记录当天生效的阈值版本判定越界并高亮**；阈值变更后全量重刷旧标记并联动重算调律提醒；记录仪批量导入（跨标签页提交锁、每日 200 条上限超额排队次日分批）；停用琴拒写并存草稿 |
 | `/reminders` | 调律周期提醒与导出 | Reminder 及全部模型 | 由周期与上次调律日期推算下次建议日期、**超期琴置顶**、按场所批量筛选、单琴档案与整库 JSON 导出导入 |
 
 ---
@@ -105,8 +105,12 @@ sologsb101-1030/
 
 ## 六、数据存储说明
 
-- **IndexedDB 库名**：`gbpianotune-db`（Dexie 封装），结构版本号 `version(1)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
-- **分表存储**：`pianos` 钢琴、`tunings` 调律、`voicings` 整音维修、`environments` 琴房环境、`reminders` 周期提醒，共 5 张表；每行带 `revision` / `createdAt` / `updatedAt`。
+- **IndexedDB 库名**：`gbpianotune-db`（Dexie 封装），结构版本号 `version(2)`（v2 由 v1 自动升级：新增阈值版本表与导入队列表）。
+- **分表存储**：`pianos` 钢琴、`tunings` 调律、`voicings` 整音维修、`environments` 琴房环境、`reminders` 周期提醒、`thresholds` 温湿度阈值版本、`envQueue` 记录仪导入队列，共 7 张表；每行带 `revision` / `createdAt` / `updatedAt`。
+- **温湿度阈值按日期生效**：每条环境记录入库时选取当天生效的阈值版本（`effectiveDate <= 记录日期` 中最新一份）判定 `abnormal` 并落库版本 id；阈值变更后以新版本全量重刷历史标记，旧标记失效。
+- **越界联动调律提醒**：上次调律后出现越界记录，下次建议日期提前到「最早越界日期 + 30 天」；阈值变更重刷标记后逐台重算，无提醒但确实越界的琴自动补建（`triggerSource: environment`，越界清除且无调律基准时回收），不会漏掉本该提醒的琴。
+- **停用琴拒写与草稿**：单条记录引用停用钢琴时不写入，表单内容存入 localStorage 草稿，下次打开新建弹窗自动恢复。
+- **批量导入并发与限额**：跨标签页通过 Web Locks API（不支持时退回 localStorage 心跳锁）互斥，两页同时提交只放一份，另一页保留钢琴选择并提示冲突；每日批量上限 200 条，超额请求拒绝写入，余下保留原始观测日期入队，次日起每天最多放行 200 条（应用启动自动尝试放行）。
 - **首屏自动播种**：`lib/utils/db.ts` 的 `initDatabase()` 在 `pianos` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（钢琴 → 调律记录 → 维修 / 环境 → 提醒），其中包含 1 台超期琴与 2 条异常环境记录，保证 5 个页面首次打开都有内容；播种幂等，清空后重进会重新播种。
 - **音分换算**：`lib/utils/cents.ts` 提供 `cents = 1200 × log2(f / f0)` 与反算、与标准音 A4 = 440 Hz 的比对、偏差分档（±5 / ±10 / ±20 / ±20 以上）与配色映射。
 - **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。

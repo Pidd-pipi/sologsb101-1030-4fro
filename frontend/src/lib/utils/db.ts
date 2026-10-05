@@ -10,14 +10,16 @@ import type { Tuning } from '$lib/types/tuning';
 import type { Voicing } from '$lib/types/voicing';
 import type { Environment } from '$lib/types/environment';
 import type { Reminder } from '$lib/types/reminder';
+import type { EnvThreshold } from '$lib/types/threshold';
+import type { EnvQueueItem } from '$lib/types/importQueue';
 import { nowIso } from './uuid';
-import { seedDatabase } from './seed';
+import { seedDatabase, defaultThresholdRow } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbpianotune-db';
 
-/** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+/** 当前数据结构版本号（v2：新增温湿度阈值版本表与记录仪导入队列表） */
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号 */
 export const ROW_REVISION = 1;
@@ -34,6 +36,8 @@ export type TuningRow = Tuning & Revisioned;
 export type VoicingRow = Voicing & Revisioned;
 export type EnvironmentRow = Environment & Revisioned;
 export type ReminderRow = Reminder & Revisioned;
+export type ThresholdRow = EnvThreshold & Revisioned;
+export type EnvQueueRow = EnvQueueItem & Revisioned;
 
 class GbPianoTuneDatabase extends Dexie {
   pianos!: Table<PianoRow, string>;
@@ -41,11 +45,14 @@ class GbPianoTuneDatabase extends Dexie {
   voicings!: Table<VoicingRow, string>;
   environments!: Table<EnvironmentRow, string>;
   reminders!: Table<ReminderRow, string>;
+  thresholds!: Table<ThresholdRow, string>;
+  envQueue!: Table<EnvQueueRow, string>;
 
   constructor() {
     super(DB_NAME);
 
-    this.version(DB_SCHEMA_VERSION)
+    // v1：五张业务表
+    this.version(1)
       .stores({
         pianos: 'id, brand, model, serialNo, type, venue, state, updatedAt',
         tunings: 'id, pianoId, date, technician, pitchRaised, updatedAt',
@@ -67,14 +74,28 @@ class GbPianoTuneDatabase extends Dexie {
             });
         }
       });
+
+    // v2：新增温湿度阈值版本表与记录仪批量导入队列表
+    this.version(2).stores({
+      pianos: 'id, brand, model, serialNo, type, venue, state, updatedAt',
+      tunings: 'id, pianoId, date, technician, pitchRaised, updatedAt',
+      voicings: 'id, pianoId, type, parts, state, date, updatedAt',
+      environments: 'id, pianoId, date, device, abnormal, batchId, thresholdVersion, updatedAt',
+      reminders: 'id, pianoId, state, nextDueDate, updatedAt',
+      thresholds: 'id, effectiveDate, updatedAt',
+      envQueue: 'id, pianoId, date, scheduledFor, status, batchId, updatedAt'
+    });
   }
 }
 
 export const db = new GbPianoTuneDatabase();
 
-/** 打开数据库：首次使用时灌入演示数据（幂等：表非空不播） */
+/** 打开数据库：首次使用时灌入演示数据（幂等：表非空不播）；老库升级后补默认阈值 */
 export async function initDatabase(): Promise<void> {
   await db.open();
+  if ((await db.thresholds.count()) === 0) {
+    await db.thresholds.put(defaultThresholdRow());
+  }
   if ((await db.pianos.count()) === 0) {
     await seedDatabase();
   }
@@ -95,13 +116,14 @@ export async function updatePiano(id: string, patch: Partial<Piano>): Promise<vo
   await db.pianos.update(id, { ...patch, updatedAt: Date.now() } as never);
 }
 
-/** 删除钢琴：级联删除其调律 / 维修 / 环境 / 提醒 */
+/** 删除钢琴：级联删除其调律 / 维修 / 环境 / 提醒 / 队列条目 */
 export async function removePiano(id: string): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
+  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders, db.envQueue], async () => {
     await db.tunings.where('pianoId').equals(id).delete();
     await db.voicings.where('pianoId').equals(id).delete();
     await db.environments.where('pianoId').equals(id).delete();
     await db.reminders.where('pianoId').equals(id).delete();
+    await db.envQueue.where('pianoId').equals(id).delete();
     await db.pianos.delete(id);
   });
 }
@@ -205,6 +227,48 @@ export async function removeReminder(id: string): Promise<void> {
   await db.reminders.delete(id);
 }
 
+/* ---------------------------- 阈值版本 ---------------------------- */
+
+export async function listThresholds(): Promise<ThresholdRow[]> {
+  const rows = await db.thresholds.toArray();
+  return rows.sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate));
+}
+
+export async function putThreshold(row: ThresholdRow): Promise<void> {
+  await db.thresholds.put(row);
+}
+
+export async function getThreshold(id: string): Promise<ThresholdRow | undefined> {
+  return db.thresholds.get(id);
+}
+
+export async function removeThreshold(id: string): Promise<void> {
+  await db.thresholds.delete(id);
+}
+
+/* --------------------------- 记录仪导入队列 --------------------------- */
+
+export async function listQueueItems(): Promise<EnvQueueRow[]> {
+  const rows = await db.envQueue.toArray();
+  return rows.sort((a, b) => a.scheduledFor.localeCompare(b.scheduledFor) || a.date.localeCompare(b.date));
+}
+
+export async function putQueueItem(row: EnvQueueRow): Promise<void> {
+  await db.envQueue.put(row);
+}
+
+export async function bulkPutQueueItems(rows: EnvQueueRow[]): Promise<void> {
+  await db.envQueue.bulkPut(rows);
+}
+
+export async function updateQueueItem(id: string, patch: Partial<EnvQueueItem>): Promise<void> {
+  await db.envQueue.update(id, { ...patch, updatedAt: Date.now() } as never);
+}
+
+export async function removeQueueItem(id: string): Promise<void> {
+  await db.envQueue.delete(id);
+}
+
 /* --------------------------- 整库导入导出 --------------------------- */
 
 export interface DatabaseSnapshot {
@@ -216,6 +280,7 @@ export interface DatabaseSnapshot {
   voicings: Voicing[];
   environments: Environment[];
   reminders: Reminder[];
+  thresholds: EnvThreshold[];
 }
 
 function stripRow<T extends Revisioned>(row: T): Omit<T, keyof Revisioned> {
@@ -227,12 +292,13 @@ function stripRow<T extends Revisioned>(row: T): Omit<T, keyof Revisioned> {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [pianos, tunings, voicings, environments, reminders] = await Promise.all([
+  const [pianos, tunings, voicings, environments, reminders, thresholds] = await Promise.all([
     db.pianos.toArray(),
     db.tunings.toArray(),
     db.voicings.toArray(),
     db.environments.toArray(),
-    db.reminders.toArray()
+    db.reminders.toArray(),
+    db.thresholds.toArray()
   ]);
   return {
     name: DB_NAME,
@@ -242,7 +308,8 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     tunings: tunings.map(stripRow),
     voicings: voicings.map(stripRow),
     environments: environments.map(stripRow),
-    reminders: reminders.map(stripRow)
+    reminders: reminders.map(stripRow),
+    thresholds: thresholds.map(stripRow)
   };
 }
 
@@ -252,44 +319,65 @@ function stamp<T>(row: T): T & Revisioned {
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
-    await Promise.all([
-      db.pianos.clear(),
-      db.tunings.clear(),
-      db.voicings.clear(),
-      db.environments.clear(),
-      db.reminders.clear()
-    ]);
-    await db.pianos.bulkPut(snapshot.pianos.map(stamp));
-    await db.tunings.bulkPut(snapshot.tunings.map(stamp));
-    await db.voicings.bulkPut(snapshot.voicings.map(stamp));
-    await db.environments.bulkPut(snapshot.environments.map(stamp));
-    await db.reminders.bulkPut(snapshot.reminders.map(stamp));
-  });
+  await db.transaction(
+    'rw',
+    [db.pianos, db.tunings, db.voicings, db.environments, db.reminders, db.thresholds, db.envQueue],
+    async () => {
+      await Promise.all([
+        db.pianos.clear(),
+        db.tunings.clear(),
+        db.voicings.clear(),
+        db.environments.clear(),
+        db.reminders.clear(),
+        db.thresholds.clear(),
+        db.envQueue.clear()
+      ]);
+      await db.pianos.bulkPut(snapshot.pianos.map(stamp));
+      await db.tunings.bulkPut(snapshot.tunings.map(stamp));
+      await db.voicings.bulkPut(snapshot.voicings.map(stamp));
+      await db.environments.bulkPut(snapshot.environments.map(stamp));
+      await db.reminders.bulkPut(snapshot.reminders.map(stamp));
+      const thresholds = snapshot.thresholds ?? [];
+      if (thresholds.length > 0) {
+        await db.thresholds.bulkPut(thresholds.map(stamp));
+      } else {
+        // 兼容旧版本备份：补一份内置默认阈值
+        await db.thresholds.put(stamp(defaultThresholdRow()));
+      }
+    }
+  );
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
-    await Promise.all([
-      db.pianos.clear(),
-      db.tunings.clear(),
-      db.voicings.clear(),
-      db.environments.clear(),
-      db.reminders.clear()
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.pianos, db.tunings, db.voicings, db.environments, db.reminders, db.thresholds, db.envQueue],
+    async () => {
+      await Promise.all([
+        db.pianos.clear(),
+        db.tunings.clear(),
+        db.voicings.clear(),
+        db.environments.clear(),
+        db.reminders.clear(),
+        db.thresholds.clear(),
+        db.envQueue.clear()
+      ]);
+    }
+  );
   await seedDatabase();
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [pianos, tunings, voicings, environments, reminders] = await Promise.all([
+  const [pianos, tunings, voicings, environments, reminders, thresholds, envQueue] = await Promise.all([
     db.pianos.count(),
     db.tunings.count(),
     db.voicings.count(),
     db.environments.count(),
-    db.reminders.count()
+    db.reminders.count(),
+    db.thresholds.count(),
+    db.envQueue.where('status').equals('待处理').count()
   ]);
-  return { pianos, tunings, voicings, environments, reminders };
+  return { pianos, tunings, voicings, environments, reminders, thresholds, envQueue };
 }

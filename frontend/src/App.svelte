@@ -67,6 +67,9 @@
       <div>本地库 {DB_NAME} · v{DB_SCHEMA_VERSION}</div>
       <div>钢琴 {counts.pianos ?? 0} · 调律 {counts.tunings ?? 0} · 维修 {counts.voicings ?? 0}</div>
       <div>环境 {counts.environments ?? 0} · 提醒 {counts.reminders ?? 0}</div>
+      {#if (counts.envQueue ?? 0) > 0}
+        <div class="mt-0.5 text-amber-300">导入队列待处理 {counts.envQueue} 条</div>
+      {/if}
       <div class="mt-1 text-stone-500">{dbReady ? '本地库已就绪' : '正在打开本地库…'}</div>
     </div>
   </aside>
