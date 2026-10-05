@@ -3,8 +3,9 @@
  * 只在 pianos 表为空时执行。钢琴 → 调律记录 → 维修 / 环境 → 周期提醒 互相引用，
  * 其中包含 1 台超期琴与 2 条异常环境记录，保证 5 个页面第一次进入都有内容可看。
  */
-import type { PianoRow, TuningRow, VoicingRow, EnvironmentRow, ReminderRow } from './db';
+import type { PianoRow, TuningRow, VoicingRow, EnvironmentRow, ReminderRow, ThresholdRow } from './db';
 import { db, ROW_REVISION } from './db';
+import { DEFAULT_THRESHOLD } from '$lib/types/threshold';
 
 function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
   const now = Date.now();
@@ -71,13 +72,18 @@ const REMINDERS: Array<Omit<ReminderRow, 'revision' | 'createdAt' | 'updatedAt'>
   { id: 'rm-003', pianoId: 'pn-003', cycleMonths: 12, lastTuningDate: '2023-11-02', nextDueDate: '2024-11-02', state: '超期' }
 ];
 
-/** 灌入演示数据（钢琴 → 调律 → 维修 / 环境 → 提醒） */
+const THRESHOLDS: Array<Omit<ThresholdRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+  { id: 'th-001', ...DEFAULT_THRESHOLD }
+];
+
+/** 灌入演示数据（钢琴 → 调律 → 维修 / 环境 → 提醒 → 阈值） */
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
+  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders, db.thresholds], async () => {
     await db.pianos.bulkPut(PIANOS.map(rev));
     await db.tunings.bulkPut(TUNINGS.map(rev));
     await db.voicings.bulkPut(VOICINGS.map(rev));
     await db.environments.bulkPut(ENVIRONMENTS.map(rev));
     await db.reminders.bulkPut(REMINDERS.map(rev));
+    await db.thresholds.bulkPut(THRESHOLDS.map(rev));
   });
 }

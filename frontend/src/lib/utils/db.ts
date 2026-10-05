@@ -10,6 +10,8 @@ import type { Tuning } from '$lib/types/tuning';
 import type { Voicing } from '$lib/types/voicing';
 import type { Environment } from '$lib/types/environment';
 import type { Reminder } from '$lib/types/reminder';
+import type { Threshold } from '$lib/types/threshold';
+import type { BatchDraft } from '$lib/types/batchDraft';
 import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 
@@ -17,10 +19,13 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbpianotune-db';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号 */
 export const ROW_REVISION = 1;
+
+/** 每日批量导入额度（超过则拒绝并排队分批，余下排到次日） */
+export const DAILY_BATCH_LIMIT = 200;
 
 /** 带时间戳与修订号的持久化实体 */
 export interface Revisioned {
@@ -34,6 +39,8 @@ export type TuningRow = Tuning & Revisioned;
 export type VoicingRow = Voicing & Revisioned;
 export type EnvironmentRow = Environment & Revisioned;
 export type ReminderRow = Reminder & Revisioned;
+export type ThresholdRow = Threshold & Revisioned;
+export type BatchDraftRow = BatchDraft & Revisioned;
 
 class GbPianoTuneDatabase extends Dexie {
   pianos!: Table<PianoRow, string>;
@@ -41,6 +48,8 @@ class GbPianoTuneDatabase extends Dexie {
   voicings!: Table<VoicingRow, string>;
   environments!: Table<EnvironmentRow, string>;
   reminders!: Table<ReminderRow, string>;
+  thresholds!: Table<ThresholdRow, string>;
+  batchDrafts!: Table<BatchDraftRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -50,8 +59,10 @@ class GbPianoTuneDatabase extends Dexie {
         pianos: 'id, brand, model, serialNo, type, venue, state, updatedAt',
         tunings: 'id, pianoId, date, technician, pitchRaised, updatedAt',
         voicings: 'id, pianoId, type, parts, state, date, updatedAt',
-        environments: 'id, pianoId, date, device, abnormal, updatedAt',
-        reminders: 'id, pianoId, state, nextDueDate, updatedAt'
+        environments: 'id, pianoId, date, device, abnormal, updatedAt, createdAt',
+        reminders: 'id, pianoId, state, nextDueDate, updatedAt',
+        thresholds: 'id, effectiveFrom, updatedAt',
+        batchDrafts: 'id, batchId, reason, status, plannedDate, updatedAt'
       })
       .upgrade(async (tx) => {
         // 结构迁移：为历史行补齐行修订号与时间戳；新建库时各表为空，迁移天然幂等
@@ -205,6 +216,48 @@ export async function removeReminder(id: string): Promise<void> {
   await db.reminders.delete(id);
 }
 
+/* ---------------------------- 温湿度阈值 ---------------------------- */
+
+export async function listThresholds(): Promise<ThresholdRow[]> {
+  const rows = await db.thresholds.toArray();
+  return rows.sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+}
+
+export async function putThreshold(row: ThresholdRow): Promise<void> {
+  await db.thresholds.put(row);
+}
+
+export async function removeThreshold(id: string): Promise<void> {
+  await db.thresholds.delete(id);
+}
+
+/* ---------------------------- 批量导入草稿 ---------------------------- */
+
+export async function listBatchDrafts(): Promise<BatchDraftRow[]> {
+  const rows = await db.batchDrafts.toArray();
+  return rows.sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+export async function putBatchDraft(row: BatchDraftRow): Promise<void> {
+  await db.batchDrafts.put(row);
+}
+
+export async function updateBatchDraft(id: string, patch: Partial<BatchDraft>): Promise<void> {
+  await db.batchDrafts.update(id, { ...patch, updatedAt: Date.now() } as never);
+}
+
+export async function removeBatchDraft(id: string): Promise<void> {
+  await db.batchDrafts.delete(id);
+}
+
+/** 今天写入的环境记录条数（按 createdAt 落在哪一天统计，用于每日批量额度） */
+export async function countEnvironmentsCreatedToday(): Promise<number> {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const end = start + 86400000;
+  return db.environments.where('createdAt').between(start, end, true, false).count();
+}
+
 /* --------------------------- 整库导入导出 --------------------------- */
 
 export interface DatabaseSnapshot {
@@ -216,6 +269,8 @@ export interface DatabaseSnapshot {
   voicings: Voicing[];
   environments: Environment[];
   reminders: Reminder[];
+  thresholds: Threshold[];
+  batchDrafts: BatchDraft[];
 }
 
 function stripRow<T extends Revisioned>(row: T): Omit<T, keyof Revisioned> {
@@ -227,12 +282,14 @@ function stripRow<T extends Revisioned>(row: T): Omit<T, keyof Revisioned> {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [pianos, tunings, voicings, environments, reminders] = await Promise.all([
+  const [pianos, tunings, voicings, environments, reminders, thresholds, batchDrafts] = await Promise.all([
     db.pianos.toArray(),
     db.tunings.toArray(),
     db.voicings.toArray(),
     db.environments.toArray(),
-    db.reminders.toArray()
+    db.reminders.toArray(),
+    db.thresholds.toArray(),
+    db.batchDrafts.toArray()
   ]);
   return {
     name: DB_NAME,
@@ -242,7 +299,9 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     tunings: tunings.map(stripRow),
     voicings: voicings.map(stripRow),
     environments: environments.map(stripRow),
-    reminders: reminders.map(stripRow)
+    reminders: reminders.map(stripRow),
+    thresholds: thresholds.map(stripRow),
+    batchDrafts: batchDrafts.map(stripRow)
   };
 }
 
@@ -252,31 +311,37 @@ function stamp<T>(row: T): T & Revisioned {
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
+  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders, db.thresholds, db.batchDrafts], async () => {
     await Promise.all([
       db.pianos.clear(),
       db.tunings.clear(),
       db.voicings.clear(),
       db.environments.clear(),
-      db.reminders.clear()
+      db.reminders.clear(),
+      db.thresholds.clear(),
+      db.batchDrafts.clear()
     ]);
     await db.pianos.bulkPut(snapshot.pianos.map(stamp));
     await db.tunings.bulkPut(snapshot.tunings.map(stamp));
     await db.voicings.bulkPut(snapshot.voicings.map(stamp));
     await db.environments.bulkPut(snapshot.environments.map(stamp));
     await db.reminders.bulkPut(snapshot.reminders.map(stamp));
+    await db.thresholds.bulkPut(snapshot.thresholds.map(stamp));
+    await db.batchDrafts.bulkPut(snapshot.batchDrafts.map(stamp));
   });
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
+  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders, db.thresholds, db.batchDrafts], async () => {
     await Promise.all([
       db.pianos.clear(),
       db.tunings.clear(),
       db.voicings.clear(),
       db.environments.clear(),
-      db.reminders.clear()
+      db.reminders.clear(),
+      db.thresholds.clear(),
+      db.batchDrafts.clear()
     ]);
   });
   await seedDatabase();
@@ -284,12 +349,14 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [pianos, tunings, voicings, environments, reminders] = await Promise.all([
+  const [pianos, tunings, voicings, environments, reminders, thresholds, batchDrafts] = await Promise.all([
     db.pianos.count(),
     db.tunings.count(),
     db.voicings.count(),
     db.environments.count(),
-    db.reminders.count()
+    db.reminders.count(),
+    db.thresholds.count(),
+    db.batchDrafts.count()
   ]);
-  return { pianos, tunings, voicings, environments, reminders };
+  return { pianos, tunings, voicings, environments, reminders, thresholds, batchDrafts };
 }

@@ -27,6 +27,10 @@
   } from '$lib/stores/environmentStore';
   import type { FilterModel } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
+  import BatchImportPanel from '$lib/components/BatchImportPanel.svelte';
+  import ThresholdManager from '$lib/components/ThresholdManager.svelte';
+  import DraftBox from '$lib/components/DraftBox.svelte';
+  import { flushDueDrafts } from '$lib/utils/batchImport';
 
   const pianos = useIdbTable<PianoRow>(db.pianos, (a, b) => a.brand.localeCompare(b.brand, 'zh-Hans-CN'));
   const environments = useIdbTable<EnvironmentRow>(db.environments, (a, b) => b.date.localeCompare(a.date));
@@ -139,6 +143,8 @@
       query[key] = value;
     });
     setEnvironmentFilters(queryToFilters(query, ENVIRONMENT_FILTER_KEYS));
+    // 进入页面时自动刷新到期草稿（含昨日顺延的批量记录）
+    void flushDueDrafts().catch(() => {});
   });
 </script>
 
@@ -232,6 +238,12 @@
       </table>
     </div>
   {/if}
+
+  <div class="grid gap-4 lg:grid-cols-2">
+    <BatchImportPanel />
+    <ThresholdManager />
+  </div>
+  <DraftBox />
 </div>
 
 {#if dialogOpen}

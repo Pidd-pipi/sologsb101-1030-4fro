@@ -31,7 +31,7 @@
     setReminderFilters,
     sortByUrgency
   } from '$lib/stores/reminderStore';
-  import { buildPianoArchive, downloadJson, parseArchive, serializeArchive } from '$lib/utils/export';
+  import { buildPianoArchive, downloadJson, parseSnapshot, serializeArchive } from '$lib/utils/export';
   import type { FilterModel } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
 
@@ -193,11 +193,7 @@
   async function doImport(): Promise<void> {
     importError = null;
     try {
-      const parsed = parseArchive(importText);
-      const snapshot = parsed as unknown as Awaited<ReturnType<typeof exportSnapshot>>;
-      if (!Array.isArray((snapshot as unknown as { pianos?: unknown[] }).pianos)) {
-        throw new Error('缺少 pianos 数组字段，不是本应用的备份文件');
-      }
+      const snapshot = parseSnapshot(importText);
       await importSnapshot(snapshot);
       await refreshCounts();
       importOpen = false;

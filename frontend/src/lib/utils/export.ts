@@ -7,7 +7,7 @@ import type { Tuning } from '$lib/types/tuning';
 import type { Voicing } from '$lib/types/voicing';
 import type { Environment } from '$lib/types/environment';
 import type { Reminder } from '$lib/types/reminder';
-import { DB_NAME, DB_SCHEMA_VERSION, db, listEnvironments, listTunings, listVoicings } from './db';
+import { DB_NAME, DB_SCHEMA_VERSION, db, listEnvironments, listTunings, listVoicings, type DatabaseSnapshot } from './db';
 import { nowIso } from './uuid';
 import { zoneDistribution } from './cents';
 
@@ -102,6 +102,30 @@ export function parseArchive(text: string): PianoArchive {
   if (!candidate.piano || typeof candidate.piano.id !== 'string') throw new Error('缺少 piano.id 字段');
   if (!Array.isArray(candidate.tunings)) throw new Error('tunings 必须是数组');
   return candidate as PianoArchive;
+}
+
+/** 校验并解析整库备份 JSON，失败时抛出可读错误 */
+export function parseSnapshot(text: string): DatabaseSnapshot {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('不是合法的 JSON 文本');
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error('备份根节点必须是对象');
+  }
+  const candidate = parsed as Partial<DatabaseSnapshot>;
+  if (typeof candidate.name !== 'string') throw new Error('缺少 name 字段');
+  if (typeof candidate.schemaVersion !== 'number') throw new Error('缺少 schemaVersion 字段');
+  if (!Array.isArray(candidate.pianos)) throw new Error('缺少 pianos 数组字段');
+  if (!Array.isArray(candidate.environments)) throw new Error('缺少 environments 数组字段');
+  if (!Array.isArray(candidate.reminders)) throw new Error('缺少 reminders 数组字段');
+  // 旧备份可能没有 thresholds / batchDrafts，补齐为空数组
+  const snapshot = candidate as DatabaseSnapshot;
+  snapshot.thresholds ??= [];
+  snapshot.batchDrafts ??= [];
+  return snapshot;
 }
 
 /** 触发浏览器下载（纯前端，无需后端） */

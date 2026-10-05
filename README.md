@@ -70,7 +70,7 @@ npm run check      # 仅做类型检查
 | `/pianos` | 钢琴档案台账 | Piano、Tuning、Reminder | 新建/编辑/删除琴档（删除确认与级联）、按品牌/类型/场所筛选、卡片回显最近调律日期、平均音分偏差与下次建议日期、筛选同步 URL query |
 | `/tunings` | 调律记录 | Tuning、Piano | 录入基准音高与低/中/高音区音分偏差、自动计算平均与最大值、**音区偏差条形图**、超阈值自动标记需复调 |
 | `/voicings` | 整音与维修 | Voicing、Piano | 登记毡槌/击弦机/换弦/踏板事项、按钢琴汇总维修履历、切换计划/已完成（完成回写钢琴状态） |
-| `/environments` | 琴房温湿度记录 | Environment、Piano | 按日期录入温湿度、**超出建议区间（18–26 ℃ / 40–60 %）自动判定并用 Tailwind 高亮超标行**、超标天数统计 |
+| `/environments` | 琴房温湿度记录 | Environment、Piano、Threshold、BatchDraft | 按日期录入温湿度、**按当天生效阈值判定超标**、**批量导入记录仪数据（跨标签页互斥、每日 200 条额度、超出排队分批）**、阈值版本管理与变更重算、草稿箱（停用钢琴 / 额度溢出 / 无效记录）、超标天数统计 |
 | `/reminders` | 调律周期提醒与导出 | Reminder 及全部模型 | 由周期与上次调律日期推算下次建议日期、**超期琴置顶**、按场所批量筛选、单琴档案与整库 JSON 导出导入 |
 
 ---
@@ -92,11 +92,12 @@ sologsb101-1030/
     ├── public/favicon.svg
     └── src/
         ├── main.ts  App.svelte  app.css  vite-env.d.ts
-        ├── lib/types/              # piano.ts tuning.ts voicing.ts environment.ts reminder.ts filter.ts
-        ├── lib/stores/             # pianoStore tuningStore voicingStore environmentStore reminderStore
-        ├── lib/components/common/  # CentsTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
+        ├── lib/types/              # piano.ts tuning.ts voicing.ts environment.ts reminder.ts threshold.ts batchDraft.ts filter.ts
+        ├── lib/stores/             # pianoStore tuningStore voicingStore environmentStore reminderStore thresholdStore batchDraftStore
+        ├── lib/components/         # common/CentsTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
+        │                           # BatchImportPanel.svelte ThresholdManager.svelte DraftBox.svelte
         ├── lib/hooks/              # useCentsDeviation.ts useIdbTable.ts
-        ├── lib/utils/              # cents.ts db.ts export.ts seed.ts uuid.ts query.ts
+        ├── lib/utils/              # cents.ts db.ts export.ts seed.ts uuid.ts query.ts locks.ts recompute.ts batchImport.ts
         ├── lib/router/index.ts     # 路由表与导航配置
         └── routes/                 # pianos/ tunings/ voicings/ environments/ reminders/ 各一个 +page.svelte
 ```
@@ -105,9 +106,11 @@ sologsb101-1030/
 
 ## 六、数据存储说明
 
-- **IndexedDB 库名**：`gbpianotune-db`（Dexie 封装），结构版本号 `version(1)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
-- **分表存储**：`pianos` 钢琴、`tunings` 调律、`voicings` 整音维修、`environments` 琴房环境、`reminders` 周期提醒，共 5 张表；每行带 `revision` / `createdAt` / `updatedAt`。
-- **首屏自动播种**：`lib/utils/db.ts` 的 `initDatabase()` 在 `pianos` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（钢琴 → 调律记录 → 维修 / 环境 → 提醒），其中包含 1 台超期琴与 2 条异常环境记录，保证 5 个页面首次打开都有内容；播种幂等，清空后重进会重新播种。
+- **IndexedDB 库名**：`gbpianotune-db`（Dexie 封装），结构版本号 `version(2)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
+- **分表存储**：`pianos` 钢琴、`tunings` 调律、`voicings` 整音维修、`environments` 琴房环境、`reminders` 周期提醒、`thresholds` 温湿度阈值版本、`batchDrafts` 批量导入草稿，共 7 张表；每行带 `revision` / `createdAt` / `updatedAt`。
+- **阈值生效判定**：每条环境记录按「记录当天生效的阈值」（`effectiveFrom <= date` 的最后一个版本）判定是否越界；阈值变更后旧标记失效，需重算全部记录并刷新提醒。
+- **批量导入编排**：跨标签页互斥锁（Web Locks API，两标签页同时提交只锁一份，另一页保留选择并提示冲突）；引用停用钢琴的记录留作草稿；每日批量额度 200 条，超出则拒绝请求并排队分批，余下排到次日。
+- **首屏自动播种**：`lib/utils/db.ts` 的 `initDatabase()` 在 `pianos` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（钢琴 → 调律记录 → 维修 / 环境 → 提醒）与一个默认阈值版本，保证 5 个页面首次打开都有内容；播种幂等，清空后重进会重新播种。
 - **音分换算**：`lib/utils/cents.ts` 提供 `cents = 1200 × log2(f / f0)` 与反算、与标准音 A4 = 440 Hz 的比对、偏差分档（±5 / ±10 / ±20 / ±20 以上）与配色映射。
 - **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。
 - **级联规则**：删除钢琴会级联删除其调律、维修、环境与提醒记录。

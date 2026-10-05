@@ -6,6 +6,7 @@ import type { FilterModel } from '$lib/types/filter';
 import type { Environment } from '$lib/types/environment';
 import { putEnvironment, removeEnvironment, updateEnvironment as updateEnvironmentRow } from '$lib/utils/db';
 import { buildRow } from '$lib/hooks/useIdbTable';
+import { recomputeReminders } from '$lib/utils/recompute';
 
 /** 参与 URL 同步的筛选键（switch 为「仅看超标记录」开关） */
 export const ENVIRONMENT_FILTER_KEYS = ['pianoIds', 'switch'];
@@ -28,13 +29,16 @@ export function resetEnvironmentFilters(): void {
 export async function createEnvironment(payload: Omit<Environment, 'id'>): Promise<string> {
   const row = buildRow(payload, 'environment');
   await putEnvironment(row);
+  await recomputeReminders();
   return row.id;
 }
 
 export async function editEnvironment(id: string, patch: Partial<Environment>): Promise<void> {
   await updateEnvironmentRow(id, patch);
+  await recomputeReminders();
 }
 
 export async function deleteEnvironment(id: string): Promise<void> {
   await removeEnvironment(id);
+  await recomputeReminders();
 }
